@@ -1,0 +1,118 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zuul-config
+  namespace: zuul-security
+data:
+  application.properties: |
+    # Zuul Configuration
+    server.port=8080
+    server.servlet.context-path=/
+
+    # Security Headers
+    zuul.headers.X-Frame-Options=DENY
+    zuul.headers.X-Content-Type-Options=nosniff
+    zuul.headers.X-XSS-Protection=1; mode=block
+    zuul.headers.Strict-Transport-Security=max-age=31536000; includeSubDomains
+    zuul.headers.Content-Security-Policy=default-src 'self'
+
+    # SSL/TLS Configuration
+    server.ssl.enabled=true
+    server.ssl.key-store=/etc/ssl/certs/keystore.jks
+    server.ssl.key-store-password=${KEYSTORE_PASSWORD}
+    server.ssl.key-alias=zuul-gateway
+    server.ssl.key-store-type=JKS
+    server.ssl.protocol=TLS
+    server.ssl.enabled-protocols=TLSv1.3,TLSv1.2
+    server.ssl.ciphers=TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256,TLS_AES_128_GCM_SHA256
+
+    # Circuit Breaker
+    hystrix.command.default.execution.isolation.thread.timeoutInMilliseconds=60000
+    hystrix.command.default.circuitBreaker.requestVolumeThreshold=20
+    hystrix.command.default.circuitBreaker.errorThresholdPercentage=50
+
+    # Rate Limiting
+    zuul.ratelimit.enabled=true
+    zuul.ratelimit.repository=IN_MEMORY
+    zuul.ratelimit.default-policy.limit=1000
+    zuul.ratelimit.default-policy.refresh-interval=60
+    zuul.ratelimit.default-policy.type=url,user
+
+    # Health and Monitoring
+    management.endpoints.web.exposure.include=health,info,metrics,prometheus
+    management.endpoint.health.show-details=when-authorized
+    management.endpoint.health.roles=ACTUATOR
+    management.health.diskspace.enabled=true
+    management.health.db.enabled=false
+
+    # Logging Security
+    logging.level.com.netflix.zuul.security=DEBUG
+    logging.level.com.netflix.zuul.filters=INFO
+    logging.pattern.console=%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level [%X{traceId:-},%X{spanId:-}] %logger{36} - %msg%n
+
+    # Zero Trust Configuration
+    zuul.security.oauth2.enabled=true
+    zuul.security.jwt.enabled=true
+    zuul.security.mtls.enabled=true
+    zuul.security.cors.enabled=true
+    zuul.security.cors.allowed-origins=https://*.yourdomain.com
+    zuul.security.cors.allowed-methods=GET,POST,PUT,DELETE,OPTIONS
+    zuul.security.cors.allowed-headers=Authorization,Content-Type,X-Requested-With
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-scanner-config
+  namespace: security-scanning
+data:
+  grype.yaml: |
+    # Grype vulnerability scanner configuration
+    ignore:
+      - vulnerability: "CVE-2023-XXXXX"
+        fix-state: "not-fixed"
+        package:
+          name: "vulnerable-package"
+          version: "1.0.0"
+
+    scope: "Squashed"
+    log:
+      level: "info"
+
+    output:
+      - "json"
+      - "sarif"
+
+    fail-on-severity: "medium"
+
+    registry:
+      insecure-skip-tls-verify: false
+      insecure-use-http: false
+
+    check-for-app-update: false
+
+  syft.yaml: |
+    # Syft SBOM generation configuration
+    package:
+      search:
+        unindexed-archives: false
+        indexed-archives: true
+      cataloger:
+        enabled: true
+        scope: "Squashed"
+
+    file-metadata:
+      cataloger:
+        enabled: true
+
+    secrets:
+      cataloger:
+        enabled: true
+        reveal-values: false
+        skip-files-above-size: 1MB
+
+    output:
+      - "spdx-json"
+      - "cyclonedx-json"
+
+    log:
+      level: "info"

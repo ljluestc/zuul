@@ -1,0 +1,162 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zuul-gateway
+  namespace: zuul-security
+  labels:
+    app: zuul-gateway
+    version: v1
+    security.compliance.level: "high"
+    security.scan.required: "true"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: zuul-gateway
+  template:
+    metadata:
+      labels:
+        app: zuul-gateway
+        version: v1
+        security.scan.status: "passed"
+        security.sbom.generated: "true"
+        security.compliance.level: "high"
+        security.clearance: "high"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+        sidecar.istio.io/inject: "true"
+        security.sbom.url: "https://sbom-storage.yourdomain.com/zuul-gateway/sbom.spdx.json"
+        security.image.signed: "true"
+    spec:
+      serviceAccountName: zuul-gateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      automountServiceAccountToken: false
+      containers:
+      - name: zuul-gateway
+        image: your-registry.com/zuul-gateway:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        - containerPort: 8443
+          name: https
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+        env:
+        - name: JAVA_OPTS
+          value: "-Xmx1g -Xms512m -XX:+UseG1GC -XX:+UseContainerSupport -Djava.security.egd=file:/dev/./urandom"
+        - name: SPRING_PROFILES_ACTIVE
+          value: "production,security,kubernetes"
+        - name: KEYSTORE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: zuul-tls-secret
+              key: keystore-password
+        - name: SERVER_PORT
+          value: "8080"
+        - name: MANAGEMENT_SERVER_PORT
+          value: "8080"
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: tls-certs
+          mountPath: /etc/ssl/certs
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /app/cache
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 12
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+            ephemeral-storage: "1Gi"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+            ephemeral-storage: "2Gi"
+      volumes:
+      - name: config
+        configMap:
+          name: zuul-config
+      - name: tls-certs
+        secret:
+          secretName: zuul-tls-secret
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir:
+          sizeLimit: 1Gi
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: zuul-gateway
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+      - key: "security"
+        operator: "Equal"
+        value: "required"
+        effect: "NoSchedule"
+      nodeSelector:
+        security.k8s.io/trusted: "true"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zuul-tls-secret
+  namespace: zuul-security
+type: kubernetes.io/tls
+data:
+  # Generate these using:
+  # openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout tls.key -out tls.crt -subj "/CN=zuul-gateway"
+  # kubectl create secret tls zuul-tls-secret --cert=tls.crt --key=tls.key -n zuul-security
+  tls.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t  # Base64 encoded certificate
+  tls.key: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t    # Base64 encoded private key
+  keystore-password: cGFzc3dvcmQ=                     # Base64 encoded "password"

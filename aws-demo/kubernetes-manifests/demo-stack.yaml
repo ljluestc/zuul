@@ -1,0 +1,979 @@
+# Complete Zero Trust Demo Application Stack
+# This deploys the full demo with Zuul Gateway, backend services, and security infrastructure
+
+---
+# Namespaces for different security domains
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zuul-gateway
+  labels:
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    security.domain: "dmz"
+    security.compliance.level: "high"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend-services
+  labels:
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    security.domain: "internal"
+    security.compliance.level: "high"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data-services
+  labels:
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    security.domain: "data"
+    security.compliance.level: "critical"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    security.domain: "shared-services"
+    security.compliance.level: "medium"
+
+---
+# Service Accounts with least privilege
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zuul-gateway-sa
+  namespace: zuul-gateway
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: user-service-sa
+  namespace: backend-services
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: order-service-sa
+  namespace: backend-services
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres-sa
+  namespace: data-services
+automountServiceAccountToken: false
+
+---
+# RBAC for service accounts
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: zuul-gateway
+  name: zuul-gateway-role
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zuul-gateway-binding
+  namespace: zuul-gateway
+subjects:
+- kind: ServiceAccount
+  name: zuul-gateway-sa
+  namespace: zuul-gateway
+roleRef:
+  kind: Role
+  name: zuul-gateway-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ConfigMaps for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zuul-gateway-config
+  namespace: zuul-gateway
+data:
+  application.yml: |
+    server:
+      port: 8080
+    spring:
+      application:
+        name: zuul-gateway
+      profiles:
+        active: production,security
+      security:
+        oauth2:
+          resourceserver:
+            jwt:
+              issuer-uri: https://auth.demo.local/auth/realms/zero-trust
+    management:
+      endpoints:
+        web:
+          exposure:
+            include: health,info,metrics,prometheus
+      endpoint:
+        health:
+          show-details: when-authorized
+    logging:
+      level:
+        com.netflix.zuul: INFO
+        org.springframework.security: DEBUG
+        org.springframework.web: INFO
+      pattern:
+        console: "%d{ISO8601} [%thread] %-5level [%X{traceId:-},%X{spanId:-}] %logger{36} - %msg%n"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-service-config
+  namespace: backend-services
+data:
+  application.yml: |
+    server:
+      port: 8081
+    spring:
+      application:
+        name: user-service
+      profiles:
+        active: production,security
+      datasource:
+        url: jdbc:postgresql://postgres-service.data-services:5432/userdb
+        username: userservice
+        password: ${DB_PASSWORD}
+        driver-class-name: org.postgresql.Driver
+      jpa:
+        hibernate:
+          ddl-auto: validate
+        show-sql: false
+        properties:
+          hibernate:
+            dialect: org.hibernate.dialect.PostgreSQLDialect
+      security:
+        oauth2:
+          resourceserver:
+            jwt:
+              issuer-uri: https://auth.demo.local/auth/realms/zero-trust
+    management:
+      endpoints:
+        web:
+          exposure:
+            include: health,info,metrics,prometheus
+    app:
+      version: "1.0.0"
+      security:
+        enable-audit: true
+
+---
+# Secrets for sensitive data
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: data-services
+type: Opaque
+stringData:
+  postgres-password: "secure-postgres-password-123"
+  userservice-password: "secure-userservice-password-456"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jwt-secret
+  namespace: zuul-gateway
+type: Opaque
+stringData:
+  jwt-signing-key: "jwt-super-secret-signing-key-that-should-be-rotated-regularly"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: user-service-db-secret
+  namespace: backend-services
+type: Opaque
+stringData:
+  DB_PASSWORD: "secure-userservice-password-456"
+
+---
+# PostgreSQL Database
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: data-services
+  labels:
+    app: postgres
+    security.compliance.level: "critical"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        version: v1
+        security.scan.status: "passed"
+        security.compliance.level: "critical"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+        sidecar.istio.io/inject: "true"
+    spec:
+      serviceAccountName: postgres-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_DB
+          value: "userdb"
+        - name: POSTGRES_USER
+          value: "postgres"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: postgres-password
+        - name: PGUSER
+          value: "postgres"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false  # PostgreSQL needs write access
+          runAsNonRoot: true
+          runAsUser: 999
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        - name: postgres-init
+          mountPath: /docker-entrypoint-initdb.d
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -h
+            - localhost
+            - -U
+            - postgres
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -h
+            - localhost
+            - -U
+            - postgres
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+      # PostgreSQL Exporter for metrics
+      - name: postgres-exporter
+        image: prometheuscommunity/postgres-exporter:v0.11.1
+        ports:
+        - containerPort: 9187
+          name: metrics
+        env:
+        - name: DATA_SOURCE_NAME
+          value: "postgresql://postgres:$(POSTGRES_PASSWORD)@localhost:5432/userdb?sslmode=disable"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: postgres-password
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+      - name: postgres-init
+        configMap:
+          name: postgres-init-script
+
+      nodeSelector:
+        security.k8s.io/trusted: "true"
+      tolerations:
+      - key: "data"
+        operator: "Equal"
+        value: "required"
+        effect: "NoSchedule"
+
+---
+# Persistent Volume Claim for PostgreSQL
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: data-services
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3-encrypted
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# PostgreSQL initialization script
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-script
+  namespace: data-services
+data:
+  01-init-userservice.sql: |
+    -- Create userservice database user
+    CREATE USER userservice WITH PASSWORD 'secure-userservice-password-456';
+
+    -- Grant necessary permissions
+    GRANT CONNECT ON DATABASE userdb TO userservice;
+    GRANT USAGE ON SCHEMA public TO userservice;
+    GRANT CREATE ON SCHEMA public TO userservice;
+
+    -- Create users table
+    CREATE TABLE IF NOT EXISTS users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email VARCHAR(255) UNIQUE NOT NULL,
+        first_name VARCHAR(100) NOT NULL,
+        last_name VARCHAR(100) NOT NULL,
+        roles TEXT[] DEFAULT ARRAY['USER'],
+        active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    -- Grant table permissions
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE users TO userservice;
+
+    -- Insert sample data
+    INSERT INTO users (email, first_name, last_name, roles, active) VALUES
+    ('admin@demo.local', 'System', 'Admin', ARRAY['ADMIN', 'USER'], TRUE),
+    ('user@demo.local', 'Demo', 'User', ARRAY['USER'], TRUE),
+    ('security@demo.local', 'Security', 'Officer', ARRAY['SECURITY_OFFICER'], TRUE)
+    ON CONFLICT (email) DO NOTHING;
+
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: data-services
+  labels:
+    app: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+  - name: metrics
+    port: 9187
+    targetPort: 9187
+  type: ClusterIP
+
+---
+# User Service Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: backend-services
+  labels:
+    app: user-service
+    security.compliance.level: "high"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+        version: v1
+        security.scan.status: "passed"
+        security.compliance.level: "high"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/actuator/prometheus"
+        sidecar.istio.io/inject: "true"
+    spec:
+      serviceAccountName: user-service-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: user-service
+        image: user-service:1.0.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+          name: http
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "production,security"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: user-service-db-secret
+              key: DB_PASSWORD
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /app/cache
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8081
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: config
+        configMap:
+          name: user-service-config
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir:
+          sizeLimit: 512Mi
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: user-service
+              topologyKey: kubernetes.io/hostname
+
+---
+# User Service Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: backend-services
+  labels:
+    app: user-service
+spec:
+  selector:
+    app: user-service
+  ports:
+  - name: http
+    port: 8081
+    targetPort: 8081
+  type: ClusterIP
+
+---
+# Zuul Gateway Rollout (Argo Rollouts)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: zuul-gateway
+  namespace: zuul-gateway
+  labels:
+    app: zuul-gateway
+    security.compliance.level: "high"
+spec:
+  replicas: 3
+  strategy:
+    canary:
+      steps:
+      - setWeight: 20
+      - pause: {duration: 30s}
+      - analysis:
+          templates:
+          - templateName: security-analysis
+          args:
+          - name: service-name
+            value: zuul-gateway-canary
+      - setWeight: 50
+      - pause: {duration: 60s}
+      - setWeight: 100
+
+      canaryService: zuul-gateway-canary
+      stableService: zuul-gateway-stable
+
+      trafficRouting:
+        istio:
+          virtualService:
+            name: zuul-gateway-vs
+            routes:
+            - primary
+          destinationRule:
+            name: zuul-gateway-dr
+            canarySubsetName: canary
+            stableSubsetName: stable
+
+  selector:
+    matchLabels:
+      app: zuul-gateway
+  template:
+    metadata:
+      labels:
+        app: zuul-gateway
+        version: v1
+        security.scan.status: "passed"
+        security.compliance.level: "high"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+        sidecar.istio.io/inject: "true"
+    spec:
+      serviceAccountName: zuul-gateway-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: zuul-gateway
+        image: zuul-gateway:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "production,security,kubernetes"
+        - name: JAVA_OPTS
+          value: "-Xmx1g -Xms512m -XX:+UseG1GC -XX:+UseContainerSupport"
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /app/cache
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+      volumes:
+      - name: config
+        configMap:
+          name: zuul-gateway-config
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir:
+          sizeLimit: 1Gi
+
+---
+# Zuul Gateway Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: zuul-gateway-stable
+  namespace: zuul-gateway
+  labels:
+    app: zuul-gateway
+    service: stable
+spec:
+  selector:
+    app: zuul-gateway
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zuul-gateway-canary
+  namespace: zuul-gateway
+  labels:
+    app: zuul-gateway
+    service: canary
+spec:
+  selector:
+    app: zuul-gateway
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# Load Balancer Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: zuul-gateway-lb
+  namespace: zuul-gateway
+  labels:
+    app: zuul-gateway
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:us-west-2:ACCOUNT:certificate/CERT-ID"
+    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+spec:
+  selector:
+    app: zuul-gateway
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: https
+    port: 443
+    targetPort: 8080
+  type: LoadBalancer
+
+---
+# Istio Virtual Service for traffic management
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: zuul-gateway-vs
+  namespace: zuul-gateway
+spec:
+  hosts:
+  - zuul-gateway.zuul-gateway.svc.cluster.local
+  - gateway.demo.local
+  gateways:
+  - zuul-gateway-gw
+  http:
+  - name: primary
+    route:
+    - destination:
+        host: zuul-gateway-stable.zuul-gateway.svc.cluster.local
+        subset: stable
+      weight: 100
+    - destination:
+        host: zuul-gateway-canary.zuul-gateway.svc.cluster.local
+        subset: canary
+      weight: 0
+    timeout: 30s
+    retries:
+      attempts: 3
+      perTryTimeout: 10s
+
+---
+# Istio Destination Rule for load balancing
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: zuul-gateway-dr
+  namespace: zuul-gateway
+spec:
+  host: zuul-gateway.zuul-gateway.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 10
+        maxRequestsPerConnection: 10
+    circuitBreaker:
+      consecutiveErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+  subsets:
+  - name: stable
+    labels:
+      version: stable
+  - name: canary
+    labels:
+      version: canary
+
+---
+# Istio Gateway for external traffic
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: zuul-gateway-gw
+  namespace: zuul-gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 443
+      name: https
+      protocol: HTTPS
+    tls:
+      mode: SIMPLE
+      credentialName: gateway-tls-secret
+    hosts:
+    - gateway.demo.local
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - gateway.demo.local
+    tls:
+      httpsRedirect: true
+
+---
+# Security Analysis Template for Canary Deployments
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: security-analysis
+  namespace: zuul-gateway
+spec:
+  args:
+  - name: service-name
+  metrics:
+  - name: security-score
+    interval: 30s
+    count: 3
+    successCondition: result >= 0.95
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: |
+          (
+            (security_compliance_score{service="{{args.service-name}}"} * 0.4) +
+            (vulnerability_scan_score{service="{{args.service-name}}"} * 0.3) +
+            (network_policy_compliance{service="{{args.service-name}}"} * 0.3)
+          )
+  - name: error-rate
+    interval: 30s
+    count: 3
+    successCondition: result[0] < 0.01
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: |
+          sum(rate(http_requests_total{service="{{args.service-name}}",status=~"5.."}[2m])) /
+          sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))
+
+---
+# Network Policies for Zero Trust
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-default
+  namespace: zuul-gateway
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zuul-gateway-policy
+  namespace: zuul-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: zuul-gateway
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: istio-system
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: backend-services
+    ports:
+    - protocol: TCP
+      port: 8081
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 443
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: user-service-policy
+  namespace: backend-services
+spec:
+  podSelector:
+    matchLabels:
+      app: user-service
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: zuul-gateway
+    ports:
+    - protocol: TCP
+      port: 8081
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: data-services
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-policy
+  namespace: data-services
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: backend-services
+    ports:
+    - protocol: TCP
+      port: 5432
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 9187
+  egress:
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53

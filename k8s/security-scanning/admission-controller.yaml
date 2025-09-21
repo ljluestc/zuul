@@ -1,0 +1,169 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionWebhook
+metadata:
+  name: zuul-security-validator
+spec:
+  clientConfig:
+    service:
+      name: zuul-security-webhook
+      namespace: security-policies
+      path: "/validate"
+  rules:
+  - operations: ["CREATE", "UPDATE"]
+    apiGroups: ["apps"]
+    apiVersions: ["v1"]
+    resources: ["deployments"]
+  - operations: ["CREATE", "UPDATE"]
+    apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+  namespaceSelector:
+    matchLabels:
+      security-scan: "required"
+  admissionReviewVersions: ["v1", "v1beta1"]
+  sideEffects: None
+  failurePolicy: Fail
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zuul-security-webhook
+  namespace: security-policies
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: zuul-security-webhook
+  template:
+    metadata:
+      labels:
+        app: zuul-security-webhook
+        security.scan.required: "true"
+    spec:
+      serviceAccountName: security-scanner
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+      containers:
+      - name: webhook
+        image: security/admission-controller:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8443
+          name: webhook-api
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+        env:
+        - name: TLS_CERT_FILE
+          value: "/etc/webhook/certs/tls.crt"
+        - name: TLS_PRIVATE_KEY_FILE
+          value: "/etc/webhook/certs/tls.key"
+        - name: WEBHOOK_PORT
+          value: "8443"
+        - name: GRYPE_ENDPOINT
+          value: "http://grype-service:8080"
+        volumeMounts:
+        - name: webhook-certs
+          mountPath: /etc/webhook/certs
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8443
+            scheme: HTTPS
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8443
+            scheme: HTTPS
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+      volumes:
+      - name: webhook-certs
+        secret:
+          secretName: webhook-certs
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zuul-security-webhook
+  namespace: security-policies
+spec:
+  selector:
+    app: zuul-security-webhook
+  ports:
+  - name: webhook-api
+    port: 443
+    targetPort: 8443
+    protocol: TCP
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webhook-certs
+  namespace: security-policies
+type: kubernetes.io/tls
+data:
+  # Generate these using:
+  # kubectl create secret tls webhook-certs --cert=tls.crt --key=tls.key -n security-policies
+  tls.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t  # Base64 encoded certificate
+  tls.key: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t    # Base64 encoded private key
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: admission-controller-policy
+  namespace: security-policies
+data:
+  policy.yaml: |
+    # Security admission policy
+    security_policies:
+      image_scanning:
+        required: true
+        max_critical_vulns: 0
+        max_high_vulns: 5
+        max_medium_vulns: 10
+        sbom_required: true
+
+      container_security:
+        run_as_non_root: true
+        read_only_root_filesystem: true
+        no_privilege_escalation: true
+        drop_all_capabilities: true
+
+      resource_limits:
+        memory_limit_required: true
+        cpu_limit_required: true
+        max_memory: "2Gi"
+        max_cpu: "2000m"
+
+      network_policies:
+        default_deny: true
+        egress_restricted: true
+        ingress_restricted: true
+
+      labels_required:
+        - "app"
+        - "version"
+        - "security.scan.status"
+        - "security.sbom.generated"

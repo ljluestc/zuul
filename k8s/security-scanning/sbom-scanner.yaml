@@ -1,0 +1,212 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sbom-scanner
+  namespace: security-scanning
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: sbom-scanner
+            security.scan.type: "sbom"
+        spec:
+          serviceAccountName: security-scanner
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            fsGroup: 65534
+          containers:
+          - name: syft-scanner
+            image: anchore/syft:latest
+            imagePullPolicy: Always
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              runAsNonRoot: true
+              runAsUser: 65534
+              capabilities:
+                drop:
+                - ALL
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Starting SBOM generation for Zuul Gateway..."
+
+              # Generate SBOM for the current Zuul image
+              syft zuul-gateway:latest -o spdx-json=/tmp/results/zuul-sbom-$(date +%Y%m%d).spdx.json
+              syft zuul-gateway:latest -o cyclonedx-json=/tmp/results/zuul-sbom-$(date +%Y%m%d).cyclonedx.json
+
+              # Upload to secure storage (implement your storage backend)
+              echo "SBOM generation completed successfully"
+
+              # Trigger vulnerability scan
+              /usr/local/bin/trigger-vuln-scan.sh
+            volumeMounts:
+            - name: scanner-results
+              mountPath: /tmp/results
+            - name: scanner-config
+              mountPath: /etc/syft
+              readOnly: true
+            - name: scanner-scripts
+              mountPath: /usr/local/bin
+              readOnly: true
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "100m"
+              limits:
+                memory: "512Mi"
+                cpu: "500m"
+          volumes:
+          - name: scanner-results
+            persistentVolumeClaim:
+              claimName: scanner-results-pvc
+          - name: scanner-config
+            configMap:
+              name: security-scanner-config
+              items:
+              - key: syft.yaml
+                path: config.yaml
+          - name: scanner-scripts
+            configMap:
+              name: scanner-scripts
+              defaultMode: 0755
+          restartPolicy: OnFailure
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vulnerability-scanner
+  namespace: security-scanning
+spec:
+  schedule: "30 2 * * *"  # Daily at 2:30 AM
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: vulnerability-scanner
+            security.scan.type: "vulnerability"
+        spec:
+          serviceAccountName: security-scanner
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            fsGroup: 65534
+          containers:
+          - name: grype-scanner
+            image: anchore/grype:latest
+            imagePullPolicy: Always
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              runAsNonRoot: true
+              runAsUser: 65534
+              capabilities:
+                drop:
+                - ALL
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Starting vulnerability scan for Zuul Gateway..."
+
+              # Perform vulnerability scan
+              grype zuul-gateway:latest \
+                -o json=/tmp/results/zuul-vulns-$(date +%Y%m%d).json \
+                -o sarif=/tmp/results/zuul-vulns-$(date +%Y%m%d).sarif \
+                --config /etc/grype/config.yaml
+
+              # Check for critical vulnerabilities
+              CRITICAL_COUNT=$(grype zuul-gateway:latest -o json | jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length')
+
+              if [ "$CRITICAL_COUNT" -gt 0 ]; then
+                echo "CRITICAL: Found $CRITICAL_COUNT critical vulnerabilities!"
+                # Trigger alerts (implement your alerting system)
+                /usr/local/bin/send-security-alert.sh "critical" "$CRITICAL_COUNT"
+              fi
+
+              echo "Vulnerability scan completed"
+            volumeMounts:
+            - name: scanner-results
+              mountPath: /tmp/results
+            - name: scanner-config
+              mountPath: /etc/grype
+              readOnly: true
+            - name: scanner-scripts
+              mountPath: /usr/local/bin
+              readOnly: true
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "200m"
+              limits:
+                memory: "1Gi"
+                cpu: "1000m"
+          volumes:
+          - name: scanner-results
+            persistentVolumeClaim:
+              claimName: scanner-results-pvc
+          - name: scanner-config
+            configMap:
+              name: security-scanner-config
+              items:
+              - key: grype.yaml
+                path: config.yaml
+          - name: scanner-scripts
+            configMap:
+              name: scanner-scripts
+              defaultMode: 0755
+          restartPolicy: OnFailure
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scanner-results-pvc
+  namespace: security-scanning
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: fast-ssd
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scanner-scripts
+  namespace: security-scanning
+data:
+  trigger-vuln-scan.sh: |
+    #!/bin/sh
+    echo "Triggering vulnerability scan..."
+    # Implement webhook or API call to trigger vulnerability scan
+    curl -X POST http://vulnerability-scanner-service:8080/scan \
+      -H "Content-Type: application/json" \
+      -d '{"image": "zuul-gateway:latest", "scan_type": "vulnerability"}'
+
+  send-security-alert.sh: |
+    #!/bin/sh
+    SEVERITY=$1
+    COUNT=$2
+
+    echo "Sending security alert: $SEVERITY vulnerabilities found: $COUNT"
+
+    # Send to Slack/Teams/PagerDuty
+    curl -X POST $WEBHOOK_URL \
+      -H "Content-Type: application/json" \
+      -d "{\"text\": \"🚨 Security Alert: $COUNT $SEVERITY vulnerabilities found in Zuul Gateway\"}"
+
+    # Send to monitoring system
+    curl -X POST http://monitoring-service:9090/api/v1/alerts \
+      -H "Content-Type: application/json" \
+      -d "{\"alerts\": [{\"labels\": {\"alertname\": \"SecurityVulnerability\", \"severity\": \"$SEVERITY\", \"service\": \"zuul-gateway\"}}]}"

@@ -1,0 +1,1041 @@
+# Complete Observability Stack for Zero Trust Demo
+# Includes Prometheus, Grafana, Jaeger, Falco, and custom security dashboards
+
+---
+# Prometheus Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: 'zuul-zero-trust-demo'
+        environment: 'production'
+
+    rule_files:
+      - "/etc/prometheus/rules/*.yml"
+
+    scrape_configs:
+    # Kubernetes API server
+    - job_name: 'kubernetes-apiservers'
+      kubernetes_sd_configs:
+      - role: endpoints
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: default;kubernetes;https
+
+    # Kubernetes nodes
+    - job_name: 'kubernetes-nodes'
+      kubernetes_sd_configs:
+      - role: node
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+
+    # Kubernetes pods
+    - job_name: 'kubernetes-pods'
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: kubernetes_namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: kubernetes_pod_name
+
+    # Zuul Gateway specific
+    - job_name: 'zuul-gateway'
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - zuul-gateway
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: zuul-gateway
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+
+    # Backend services
+    - job_name: 'backend-services'
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - backend-services
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+
+    # Database metrics
+    - job_name: 'postgres'
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - data-services
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: postgres
+      - source_labels: [__address__]
+        action: replace
+        regex: ([^:]+)(?::\d+)?
+        replacement: $1:9187
+        target_label: __address__
+
+    # Istio control plane
+    - job_name: 'istio-mesh'
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - istio-system
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: istio-telemetry;prometheus
+
+    # Istio proxy (Envoy) metrics
+    - job_name: 'envoy-stats'
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_container_name, __meta_kubernetes_pod_container_port_name]
+        action: keep
+        regex: istio-proxy;http-monitoring
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:15090
+        target_label: __address__
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: source_namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: source_app
+
+  # Security-focused alerting rules
+  security-rules.yml: |
+    groups:
+    - name: security.rules
+      rules:
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value }} errors per second"
+
+      - alert: SecurityPolicyViolation
+        expr: increase(security_policy_violations_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          category: security
+        annotations:
+          summary: "Security policy violation detected"
+          description: "{{ $value }} security policy violations in the last 5 minutes"
+
+      - alert: UnauthorizedAccess
+        expr: increase(http_requests_total{status="403"}[5m]) > 10
+        for: 1m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "High number of unauthorized access attempts"
+          description: "{{ $value }} unauthorized access attempts in the last 5 minutes"
+
+      - alert: VulnerabilityDetected
+        expr: vulnerability_scanner_critical_count > 0
+        for: 0m
+        labels:
+          severity: critical
+          category: security
+        annotations:
+          summary: "Critical vulnerability detected"
+          description: "{{ $value }} critical vulnerabilities found"
+
+      - alert: MTLSCertificateExpiring
+        expr: istio_cert_expiry_seconds < 604800  # 7 days
+        for: 1h
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "mTLS certificate expiring soon"
+          description: "Certificate expires in {{ $value }} seconds"
+
+      - alert: NetworkPolicyViolation
+        expr: increase(network_policy_violations_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "Network policy violation detected"
+          description: "{{ $value }} network policy violations"
+
+      - alert: SuspiciousActivity
+        expr: rate(falco_events{rule_name=~".*suspicious.*"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "Suspicious activity detected by Falco"
+          description: "Suspicious activity: {{ $labels.rule_name }}"
+
+---
+# Prometheus Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+        security.compliance.level: "medium"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: prometheus-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.45.0
+        ports:
+        - containerPort: 9090
+          name: web
+        args:
+        - '--config.file=/etc/prometheus/prometheus.yml'
+        - '--storage.tsdb.path=/prometheus/'
+        - '--web.console.libraries=/etc/prometheus/console_libraries'
+        - '--web.console.templates=/etc/prometheus/consoles'
+        - '--storage.tsdb.retention.time=15d'
+        - '--web.enable-lifecycle'
+        - '--web.enable-admin-api'
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: prometheus-config-volume
+          mountPath: /etc/prometheus/
+        - name: prometheus-storage-volume
+          mountPath: /prometheus/
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9090
+          initialDelaySeconds: 30
+          timeoutSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+          initialDelaySeconds: 30
+          timeoutSeconds: 30
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+      volumes:
+      - name: prometheus-config-volume
+        configMap:
+          defaultMode: 420
+          name: prometheus-config
+      - name: prometheus-storage-volume
+        persistentVolumeClaim:
+          claimName: prometheus-pvc
+      - name: tmp
+        emptyDir: {}
+
+---
+# Prometheus PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-pvc
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3-encrypted
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# Prometheus Service Account and RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-sa
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-role
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/proxy
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - extensions
+  resources:
+  - ingresses
+  verbs: ["get", "list", "watch"]
+- nonResourceURLs: ["/metrics"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-role
+subjects:
+- kind: ServiceAccount
+  name: prometheus-sa
+  namespace: monitoring
+
+---
+# Prometheus Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - name: web
+    port: 9090
+    targetPort: 9090
+  type: ClusterIP
+
+---
+# Grafana Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-config
+  namespace: monitoring
+data:
+  grafana.ini: |
+    [analytics]
+    check_for_updates = true
+    [grafana_net]
+    url = https://grafana.net
+    [log]
+    mode = console
+    [paths]
+    data = /var/lib/grafana/data
+    logs = /var/log/grafana
+    plugins = /var/lib/grafana/plugins
+    provisioning = /etc/grafana/provisioning
+    [security]
+    admin_user = admin
+    admin_password = admin123
+    secret_key = SW2YcwTIb9zpOOhoPsMm
+    [server]
+    http_port = 3000
+    [users]
+    allow_sign_up = false
+
+  # Datasource configuration
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      url: http://prometheus:9090
+      isDefault: true
+    - name: Jaeger
+      type: jaeger
+      access: proxy
+      url: http://jaeger-query:16686
+
+  # Dashboard provisioning
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+    - name: 'default'
+      orgId: 1
+      folder: ''
+      type: file
+      disableDeletion: false
+      updateIntervalSeconds: 10
+      allowUiUpdates: true
+      options:
+        path: /var/lib/grafana/dashboards
+
+---
+# Grafana Security Dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-security-dashboard
+  namespace: monitoring
+data:
+  security-overview.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "title": "Zero Trust Security Overview",
+        "tags": ["security", "zero-trust"],
+        "timezone": "browser",
+        "panels": [
+          {
+            "id": 1,
+            "title": "Security Policy Violations",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "sum(increase(security_policy_violations_total[5m]))",
+                "legendFormat": "Violations"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+          {
+            "id": 2,
+            "title": "Vulnerability Scan Results",
+            "type": "gauge",
+            "targets": [
+              {
+                "expr": "vulnerability_scanner_score",
+                "legendFormat": "Security Score"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+          {
+            "id": 3,
+            "title": "Authentication Failures",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "rate(http_requests_total{status=\"401\"}[5m])",
+                "legendFormat": "Auth Failures/sec"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+          },
+          {
+            "id": 4,
+            "title": "Network Policy Compliance",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "network_policy_compliance_score by (namespace)",
+                "legendFormat": "{{namespace}}"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+          },
+          {
+            "id": 5,
+            "title": "mTLS Certificate Status",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "min(istio_cert_expiry_seconds) / 86400",
+                "legendFormat": "Days to Expiry"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+          }
+        ],
+        "time": {"from": "now-1h", "to": "now"},
+        "refresh": "30s"
+      }
+    }
+
+---
+# Grafana Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+        security.compliance.level: "medium"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        fsGroup: 472
+      containers:
+      - name: grafana
+        image: grafana/grafana:10.0.0
+        ports:
+        - containerPort: 3000
+          name: http-grafana
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 472
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: grafana-config
+          mountPath: /etc/grafana/grafana.ini
+          subPath: grafana.ini
+        - name: grafana-config
+          mountPath: /etc/grafana/provisioning/datasources/datasources.yaml
+          subPath: datasources.yaml
+        - name: grafana-config
+          mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml
+          subPath: dashboards.yaml
+        - name: grafana-dashboards
+          mountPath: /var/lib/grafana/dashboards
+        - name: grafana-storage
+          mountPath: /var/lib/grafana
+        livenessProbe:
+          failureThreshold: 3
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 3000
+          timeoutSeconds: 1
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /robots.txt
+            port: 3000
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 2
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: grafana-config
+        configMap:
+          name: grafana-config
+      - name: grafana-dashboards
+        configMap:
+          name: grafana-security-dashboard
+      - name: grafana-storage
+        persistentVolumeClaim:
+          claimName: grafana-pvc
+
+---
+# Grafana PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-pvc
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3-encrypted
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# Grafana Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+  labels:
+    app: grafana
+spec:
+  selector:
+    app: grafana
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
+  type: ClusterIP
+
+---
+# Jaeger for distributed tracing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+        security.compliance.level: "medium"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+      - name: jaeger
+        image: jaegertracing/all-in-one:1.47
+        ports:
+        - containerPort: 16686
+          name: ui
+        - containerPort: 14268
+          name: collector
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 10001
+          capabilities:
+            drop:
+            - ALL
+        env:
+        - name: COLLECTOR_OTLP_ENABLED
+          value: "true"
+        - name: MEMORY_MAX_TRACES
+          value: "50000"
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: tmp
+        emptyDir: {}
+
+---
+# Jaeger Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-query
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+  - name: ui
+    port: 16686
+    targetPort: 16686
+  - name: collector
+    port: 14268
+    targetPort: 14268
+  type: ClusterIP
+
+---
+# Falco for runtime security
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: monitoring
+  labels:
+    app: falco
+spec:
+  selector:
+    matchLabels:
+      app: falco
+  template:
+    metadata:
+      labels:
+        app: falco
+        security.compliance.level: "high"
+    spec:
+      serviceAccountName: falco-sa
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/master
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/control-plane
+      containers:
+      - name: falco
+        image: falcosecurity/falco-no-driver:0.35.1
+        securityContext:
+          privileged: true
+        args:
+        - /usr/bin/falco
+        - --cri
+        - /run/containerd/containerd.sock
+        - -K
+        - /var/run/secrets/kubernetes.io/serviceaccount/token
+        - -k
+        - https://kubernetes.default
+        - --k8s-node-name
+        - $(FALCO_K8S_NODE_NAME)
+        - -pk
+        env:
+        - name: FALCO_K8S_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: boot
+          mountPath: /host/boot
+          readOnly: true
+        - name: lib-modules
+          mountPath: /host/lib/modules
+          readOnly: true
+        - name: usr
+          mountPath: /host/usr
+          readOnly: true
+        - name: etc
+          mountPath: /host/etc
+          readOnly: true
+        - name: var-run
+          mountPath: /host/var/run
+          readOnly: true
+        - name: dev
+          mountPath: /host/dev
+          readOnly: true
+        - name: falco-config
+          mountPath: /etc/falco
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: boot
+        hostPath:
+          path: /boot
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
+      - name: usr
+        hostPath:
+          path: /usr
+      - name: etc
+        hostPath:
+          path: /etc
+      - name: var-run
+        hostPath:
+          path: /var/run
+      - name: dev
+        hostPath:
+          path: /dev
+      - name: falco-config
+        configMap:
+          name: falco-config
+
+---
+# Falco Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-config
+  namespace: monitoring
+data:
+  falco.yaml: |
+    rules_file:
+      - /etc/falco/falco_rules.yaml
+      - /etc/falco/falco_rules.local.yaml
+      - /etc/falco/k8s_audit_rules.yaml
+      - /etc/falco/rules.d
+
+    time_format_iso_8601: true
+    json_output: true
+    json_include_output_property: true
+    json_include_tags_property: true
+
+    log_stderr: true
+    log_syslog: true
+    log_level: info
+
+    priority: debug
+
+    buffered_outputs: false
+
+    syscall_event_drops:
+      actions:
+        - log
+        - alert
+      rate: 0.03333
+      max_burst: 1000
+
+    outputs:
+      rate: 1
+      max_burst: 1000
+
+    syslog_output:
+      enabled: true
+
+    http_output:
+      enabled: true
+      url: "http://falco-exporter:8080/webhook"
+
+  falco_rules.local.yaml: |
+    - rule: Detect Critical Security Events
+      desc: Detect critical security events in zero trust environment
+      condition: >
+        spawned_process and (
+          proc.name in (nc, ncat, netcat, netcat.openbsd, netcat.traditional) or
+          proc.name in (wget, curl) and proc.args contains "http" or
+          proc.name = "bash" and proc.pname in (nc, ncat, netcat) or
+          proc.name in (sh, bash) and proc.args contains "-c" and proc.args contains "exec" or
+          proc.name in (python, python2, python3) and proc.args contains "socket"
+        )
+      output: >
+        Critical security event detected (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline
+        pid=%proc.pid ppid=%proc.ppid container_id=%container.id container_name=%container.name
+        image=%container.image.repository:%container.image.tag)
+      priority: CRITICAL
+      tags: [security, network, process]
+
+    - rule: Unauthorized Network Activity
+      desc: Detect unauthorized network connections
+      condition: >
+        inbound_outbound and
+        fd.typechar = 4 and fd.ip != "0.0.0.0" and
+        not proc.name in (kubelet, kube-proxy, istio-proxy, envoy) and
+        not container.image.repository in (istio/proxyv2, envoyproxy/envoy)
+      output: >
+        Unauthorized network activity (user=%user.name command=%proc.cmdline connection=%fd.name
+        container_id=%container.id container_name=%container.name image=%container.image.repository)
+      priority: WARNING
+      tags: [security, network]
+
+---
+# Falco Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: falco-sa
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: falco-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "replicationcontrollers", "events", "services", "configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions"]
+  resources: ["replicasets", "daemonsets", "deployments"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes/proxy"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: falco-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: falco-role
+subjects:
+- kind: ServiceAccount
+  name: falco-sa
+  namespace: monitoring
+
+---
+# Falco Exporter for Prometheus integration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: falco-exporter
+  namespace: monitoring
+  labels:
+    app: falco-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: falco-exporter
+  template:
+    metadata:
+      labels:
+        app: falco-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9376"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+      containers:
+      - name: falco-exporter
+        image: falcosecurity/falco-exporter:0.8.2
+        ports:
+        - containerPort: 9376
+          name: metrics
+        - containerPort: 8080
+          name: webhook
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 9376
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 9376
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+
+---
+# Falco Exporter Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: falco-exporter
+  namespace: monitoring
+  labels:
+    app: falco-exporter
+spec:
+  selector:
+    app: falco-exporter
+  ports:
+  - name: metrics
+    port: 9376
+    targetPort: 9376
+  - name: webhook
+    port: 8080
+    targetPort: 8080
+  type: ClusterIP

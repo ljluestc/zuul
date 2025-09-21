@@ -1,0 +1,73 @@
+# Local Docker Registry for kind cluster
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: local-registry
+  namespace: kube-system
+  labels:
+    app: local-registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: local-registry
+  template:
+    metadata:
+      labels:
+        app: local-registry
+    spec:
+      containers:
+      - name: registry
+        image: registry:2.8
+        ports:
+        - containerPort: 5000
+          name: registry
+        env:
+        - name: REGISTRY_STORAGE_DELETE_ENABLED
+          value: "true"
+        - name: REGISTRY_HTTP_ADDR
+          value: "0.0.0.0:5000"
+        volumeMounts:
+        - name: registry-storage
+          mountPath: /var/lib/registry
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+      volumes:
+      - name: registry-storage
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: local-registry
+  namespace: kube-system
+  labels:
+    app: local-registry
+spec:
+  selector:
+    app: local-registry
+  ports:
+  - name: registry
+    port: 5000
+    targetPort: 5000
+  type: NodePort
+  ports:
+  - port: 5000
+    targetPort: 5000
+    nodePort: 30500
+---
+# ConfigMap for registry configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:30500"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"

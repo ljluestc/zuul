@@ -1,0 +1,337 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: zuul-security-eventlistener
+  namespace: zuul-security
+spec:
+  serviceAccountName: tekton-triggers-admin
+  triggers:
+  # GitHub webhook trigger
+  - name: github-push-trigger
+    interceptors:
+    - name: "github"
+      ref:
+        name: "github"
+      params:
+      - name: "secretRef"
+        value:
+          secretName: github-webhook-secret
+          secretKey: secret
+      - name: "eventTypes"
+        value: ["push", "pull_request"]
+    - name: "cel"
+      ref:
+        name: "cel"
+      params:
+      - name: "filter"
+        value: >
+          (header.match('X-GitHub-Event', 'push') &&
+           body.ref.startsWith('refs/heads/main')) ||
+          (header.match('X-GitHub-Event', 'pull_request') &&
+           body.action in ['opened', 'synchronize'])
+    bindings:
+    - ref: github-security-binding
+    template:
+      ref: zuul-security-pipeline-template
+
+  # Security scan trigger (manual or scheduled)
+  - name: security-scan-trigger
+    interceptors:
+    - name: "cel"
+      ref:
+        name: "cel"
+      params:
+      - name: "filter"
+        value: >
+          header.match('X-Security-Scan', 'true')
+    bindings:
+    - ref: security-scan-binding
+    template:
+      ref: zuul-security-pipeline-template
+
+  # Image vulnerability trigger
+  - name: vulnerability-alert-trigger
+    interceptors:
+    - name: "webhook"
+      ref:
+        name: "webhook"
+      params:
+      - name: "objectRef"
+        value:
+          kind: Secret
+          name: vulnerability-webhook-secret
+          apiVersion: v1
+    - name: "cel"
+      ref:
+        name: "cel"
+      params:
+      - name: "filter"
+        value: >
+          body.alert_type == 'vulnerability' &&
+          body.severity in ['critical', 'high']
+    bindings:
+    - ref: vulnerability-response-binding
+    template:
+      ref: vulnerability-response-template
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: github-security-binding
+  namespace: zuul-security
+spec:
+  params:
+  - name: git-url
+    value: $(body.repository.clone_url)
+  - name: git-revision
+    value: $(body.head_commit.id)
+  - name: git-commit-message
+    value: $(body.head_commit.message)
+  - name: git-author
+    value: $(body.head_commit.author.name)
+  - name: image-tag
+    value: "$(body.head_commit.id)"
+  - name: event-type
+    value: $(header.X-GitHub-Event)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: security-scan-binding
+  namespace: zuul-security
+spec:
+  params:
+  - name: git-url
+    value: "https://github.com/Netflix/zuul.git"
+  - name: git-revision
+    value: "master"
+  - name: image-tag
+    value: "security-scan-$(uid)"
+  - name: security-threshold
+    value: $(body.scan_threshold)
+  - name: scan-type
+    value: $(body.scan_type)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: vulnerability-response-binding
+  namespace: zuul-security
+spec:
+  params:
+  - name: vulnerability-id
+    value: $(body.vulnerability.id)
+  - name: severity
+    value: $(body.vulnerability.severity)
+  - name: affected-image
+    value: $(body.artifact.image)
+  - name: response-action
+    value: $(body.recommended_action)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: zuul-security-pipeline-template
+  namespace: zuul-security
+spec:
+  params:
+  - name: git-url
+    default: "https://github.com/Netflix/zuul.git"
+  - name: git-revision
+    default: "master"
+  - name: image-tag
+    default: "latest"
+  - name: security-threshold
+    default: "medium"
+  resourcetemplates:
+  - apiVersion: tekton.dev/v1beta1
+    kind: PipelineRun
+    metadata:
+      generateName: zuul-security-pipeline-run-
+      namespace: zuul-security
+      labels:
+        security.scan.trigger: "true"
+        pipeline.type: "security"
+      annotations:
+        triggers.tekton.dev/git-url: $(tt.params.git-url)
+        triggers.tekton.dev/git-revision: $(tt.params.git-revision)
+    spec:
+      pipelineRef:
+        name: zuul-security-pipeline
+      params:
+      - name: git-url
+        value: $(tt.params.git-url)
+      - name: git-revision
+        value: $(tt.params.git-revision)
+      - name: image-registry
+        value: "your-registry.com/zuul"
+      - name: image-tag
+        value: $(tt.params.image-tag)
+      - name: security-threshold
+        value: $(tt.params.security-threshold)
+      workspaces:
+      - name: shared-data
+        volumeClaimTemplate:
+          spec:
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+            storageClassName: fast-ssd
+      - name: git-credentials
+        secret:
+          secretName: git-credentials
+      - name: registry-credentials
+        secret:
+          secretName: registry-credentials
+      serviceAccountName: zuul-security-pipeline-sa
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: vulnerability-response-template
+  namespace: zuul-security
+spec:
+  params:
+  - name: vulnerability-id
+  - name: severity
+  - name: affected-image
+  - name: response-action
+  resourcetemplates:
+  - apiVersion: tekton.dev/v1beta1
+    kind: PipelineRun
+    metadata:
+      generateName: vulnerability-response-
+      namespace: zuul-security
+      labels:
+        security.scan.type: "vulnerability-response"
+        vulnerability.severity: $(tt.params.severity)
+      annotations:
+        vulnerability.id: $(tt.params.vulnerability-id)
+        affected.image: $(tt.params.affected-image)
+    spec:
+      pipelineRef:
+        name: vulnerability-response-pipeline
+      params:
+      - name: vulnerability-id
+        value: $(tt.params.vulnerability-id)
+      - name: severity
+        value: $(tt.params.severity)
+      - name: affected-image
+        value: $(tt.params.affected-image)
+      - name: response-action
+        value: $(tt.params.response-action)
+      workspaces:
+      - name: shared-data
+        volumeClaimTemplate:
+          spec:
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                storage: 5Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scheduled-security-scan
+  namespace: zuul-security
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: tekton-triggers-admin
+          containers:
+          - name: trigger-security-scan
+            image: curlimages/curl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Trigger security pipeline via EventListener
+              curl -X POST http://el-zuul-security-eventlistener:8080 \
+                -H "Content-Type: application/json" \
+                -H "X-Security-Scan: true" \
+                -d '{
+                  "scan_type": "scheduled",
+                  "scan_threshold": "medium",
+                  "timestamp": "'$(date -Iseconds)'"
+                }'
+          restartPolicy: OnFailure
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-webhook-secret
+  namespace: zuul-security
+type: Opaque
+stringData:
+  secret: "your-github-webhook-secret"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vulnerability-webhook-secret
+  namespace: zuul-security
+type: Opaque
+stringData:
+  secret: "your-vulnerability-webhook-secret"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tekton-triggers-admin
+  namespace: zuul-security
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tekton-triggers-admin
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "secrets", "serviceaccounts"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["tekton.dev"]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["triggers.tekton.dev"]
+  resources: ["*"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tekton-triggers-admin
+subjects:
+- kind: ServiceAccount
+  name: tekton-triggers-admin
+  namespace: zuul-security
+roleRef:
+  kind: ClusterRole
+  name: tekton-triggers-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: el-zuul-security-eventlistener
+  namespace: zuul-security
+  labels:
+    app.kubernetes.io/managed-by: EventListener
+    app.kubernetes.io/part-of: Triggers
+    eventlistener: zuul-security-eventlistener
+spec:
+  ports:
+  - name: http-listener
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app.kubernetes.io/managed-by: EventListener
+    app.kubernetes.io/part-of: Triggers
+    eventlistener: zuul-security-eventlistener
+  type: ClusterIP

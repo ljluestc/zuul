@@ -1,0 +1,507 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: zuul-security-pipeline
+  namespace: zuul-security
+spec:
+  description: |
+    Comprehensive security pipeline for Zuul Gateway deployment with SBOM scanning,
+    vulnerability assessment, canary deployment, and zero-trust validation.
+  params:
+  - name: git-url
+    type: string
+    description: Git repository URL
+    default: "https://github.com/Netflix/zuul.git"
+  - name: git-revision
+    type: string
+    description: Git revision to build
+    default: "master"
+  - name: image-registry
+    type: string
+    description: Container registry
+    default: "your-registry.com/zuul"
+  - name: image-tag
+    type: string
+    description: Image tag
+    default: "latest"
+  - name: security-threshold
+    type: string
+    description: Security scan threshold (critical,high,medium,low)
+    default: "medium"
+
+  workspaces:
+  - name: shared-data
+    description: Shared workspace for pipeline data
+  - name: git-credentials
+    description: Git credentials
+  - name: registry-credentials
+    description: Container registry credentials
+
+  tasks:
+  # 1. Source Code Security Scan
+  - name: source-security-scan
+    taskRef:
+      name: git-security-scan
+    workspaces:
+    - name: source
+      workspace: shared-data
+    - name: credentials
+      workspace: git-credentials
+    params:
+    - name: url
+      value: $(params.git-url)
+    - name: revision
+      value: $(params.git-revision)
+
+  # 2. Build Application
+  - name: build-app
+    taskRef:
+      name: gradle-build
+    runAfter: ["source-security-scan"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: GRADLE_TASKS
+      value: "clean build -x test"
+
+  # 3. Unit Tests with Security Tests
+  - name: security-unit-tests
+    taskRef:
+      name: gradle-test
+    runAfter: ["build-app"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: GRADLE_TASKS
+      value: "test securityTest"
+
+  # 4. SAST (Static Application Security Testing)
+  - name: sast-scan
+    taskRef:
+      name: sonarqube-scan
+    runAfter: ["security-unit-tests"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: sonar-project-key
+      value: "zuul-gateway"
+    - name: security-gates
+      value: "true"
+
+  # 5. Build Container Image
+  - name: build-image
+    taskRef:
+      name: buildah-security-build
+    runAfter: ["sast-scan"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    - name: dockerconfig
+      workspace: registry-credentials
+    params:
+    - name: IMAGE
+      value: "$(params.image-registry):$(params.image-tag)"
+    - name: DOCKERFILE
+      value: "./Dockerfile"
+    - name: SECURITY_SCAN
+      value: "true"
+
+  # 6. Generate SBOM
+  - name: generate-sbom
+    taskRef:
+      name: syft-sbom-generate
+    runAfter: ["build-image"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-registry):$(params.image-tag)"
+    - name: OUTPUT_FORMAT
+      value: "spdx-json,cyclonedx-json"
+
+  # 7. Vulnerability Scan
+  - name: vulnerability-scan
+    taskRef:
+      name: grype-vulnerability-scan
+    runAfter: ["generate-sbom"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-registry):$(params.image-tag)"
+    - name: FAIL_ON_SEVERITY
+      value: $(params.security-threshold)
+    - name: SBOM_PATH
+      value: "sbom/zuul-sbom.spdx.json"
+
+  # 8. Container Security Scan
+  - name: container-security-scan
+    taskRef:
+      name: trivy-container-scan
+    runAfter: ["vulnerability-scan"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-registry):$(params.image-tag)"
+    - name: SECURITY_CHECKS
+      value: "vuln,config,secret"
+
+  # 9. Sign Image and SBOM
+  - name: sign-artifacts
+    taskRef:
+      name: cosign-sign
+    runAfter: ["container-security-scan"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    - name: cosign-credentials
+      workspace: registry-credentials
+    params:
+    - name: IMAGE
+      value: "$(params.image-registry):$(params.image-tag)"
+    - name: SBOM_PATH
+      value: "sbom/zuul-sbom.spdx.json"
+
+  # 10. Security Policy Validation
+  - name: policy-validation
+    taskRef:
+      name: opa-policy-check
+    runAfter: ["sign-artifacts"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-registry):$(params.image-tag)"
+    - name: POLICY_PATH
+      value: "k8s/security-policies/"
+
+  # 11. Deploy to Staging with Security Validation
+  - name: deploy-staging
+    taskRef:
+      name: kubectl-security-deploy
+    runAfter: ["policy-validation"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-registry):$(params.image-tag)"
+    - name: NAMESPACE
+      value: "zuul-staging"
+    - name: SECURITY_CHECKS
+      value: "true"
+
+  # 12. Security Integration Tests
+  - name: security-integration-tests
+    taskRef:
+      name: security-test-suite
+    runAfter: ["deploy-staging"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: STAGING_URL
+      value: "https://zuul-staging.yourdomain.com"
+    - name: TEST_SUITE
+      value: "security,penetration,compliance"
+
+  # 13. Production Canary Deployment
+  - name: canary-deployment
+    taskRef:
+      name: argo-rollouts-deploy
+    runAfter: ["security-integration-tests"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: IMAGE
+      value: "$(params.image-registry):$(params.image-tag)"
+    - name: NAMESPACE
+      value: "zuul-security"
+    - name: ROLLOUT_NAME
+      value: "zuul-gateway-rollout"
+    - name: CANARY_STEPS
+      value: "10,20,50,100"
+
+  # 14. Zero Trust Validation
+  - name: zero-trust-validation
+    taskRef:
+      name: istio-security-validation
+    runAfter: ["canary-deployment"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: NAMESPACE
+      value: "zuul-security"
+    - name: SERVICE_NAME
+      value: "zuul-gateway"
+
+  # 15. Production Security Monitoring Setup
+  - name: setup-security-monitoring
+    taskRef:
+      name: security-monitoring-setup
+    runAfter: ["zero-trust-validation"]
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: NAMESPACE
+      value: "zuul-security"
+    - name: SERVICE_NAME
+      value: "zuul-gateway"
+    - name: MONITORING_STACK
+      value: "prometheus,falco,istio"
+
+  finally:
+  # Cleanup and notifications
+  - name: security-report-generation
+    taskRef:
+      name: security-report-task
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: PIPELINE_RUN
+      value: "$(context.pipelineRun.name)"
+    - name: REPORT_FORMAT
+      value: "html,json,sarif"
+
+  - name: notify-security-team
+    taskRef:
+      name: security-notification
+    workspaces:
+    - name: source
+      workspace: shared-data
+    params:
+    - name: PIPELINE_STATUS
+      value: "$(tasks.status)"
+    - name: SECURITY_REPORT_PATH
+      value: "reports/security-$(context.pipelineRun.name).html"
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: git-security-scan
+  namespace: zuul-security
+spec:
+  description: Scan git repository for security issues
+  params:
+  - name: url
+    type: string
+  - name: revision
+    type: string
+    default: "main"
+  workspaces:
+  - name: source
+  - name: credentials
+  steps:
+  - name: clone
+    image: gcr.io/tekton-releases/github.com/tektoncd/pipeline/cmd/git-init:latest
+    script: |
+      #!/bin/sh
+      set -e
+      git clone $(params.url) $(workspaces.source.path)/source
+      cd $(workspaces.source.path)/source
+      git checkout $(params.revision)
+
+  - name: secret-scan
+    image: trufflesecurity/trufflehog:latest
+    script: |
+      #!/bin/sh
+      set -e
+      echo "Scanning for secrets in source code..."
+      trufflehog filesystem $(workspaces.source.path)/source \
+        --json \
+        --no-verification \
+        > $(workspaces.source.path)/secret-scan-results.json
+
+      # Check if any secrets were found
+      SECRET_COUNT=$(jq length $(workspaces.source.path)/secret-scan-results.json)
+      if [ "$SECRET_COUNT" -gt 0 ]; then
+        echo "ERROR: $SECRET_COUNT secrets found in source code!"
+        jq . $(workspaces.source.path)/secret-scan-results.json
+        exit 1
+      fi
+
+  - name: dependency-check
+    image: owasp/dependency-check:latest
+    script: |
+      #!/bin/sh
+      set -e
+      echo "Running OWASP dependency check..."
+      /usr/share/dependency-check/bin/dependency-check.sh \
+        --project "Zuul Gateway" \
+        --scan $(workspaces.source.path)/source \
+        --out $(workspaces.source.path)/dependency-check-report \
+        --format JSON,HTML \
+        --failOnCVSS 7
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: syft-sbom-generate
+  namespace: zuul-security
+spec:
+  description: Generate SBOM using Syft
+  params:
+  - name: IMAGE
+    type: string
+  - name: OUTPUT_FORMAT
+    type: string
+    default: "spdx-json"
+  workspaces:
+  - name: source
+  steps:
+  - name: generate-sbom
+    image: anchore/syft:latest
+    script: |
+      #!/bin/sh
+      set -e
+      echo "Generating SBOM for $(params.IMAGE)..."
+
+      mkdir -p $(workspaces.source.path)/sbom
+
+      # Generate SBOM in multiple formats
+      IFS=','
+      for format in $(params.OUTPUT_FORMAT); do
+        echo "Generating SBOM in $format format..."
+        syft $(params.IMAGE) -o $format=$(workspaces.source.path)/sbom/zuul-sbom.$format
+      done
+
+      # Validate SBOM
+      if [ ! -f "$(workspaces.source.path)/sbom/zuul-sbom.spdx-json" ]; then
+        echo "ERROR: SBOM generation failed!"
+        exit 1
+      fi
+
+      echo "SBOM generated successfully"
+      ls -la $(workspaces.source.path)/sbom/
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: grype-vulnerability-scan
+  namespace: zuul-security
+spec:
+  description: Vulnerability scanning with Grype
+  params:
+  - name: IMAGE
+    type: string
+  - name: FAIL_ON_SEVERITY
+    type: string
+    default: "medium"
+  - name: SBOM_PATH
+    type: string
+    default: ""
+  workspaces:
+  - name: source
+  steps:
+  - name: vulnerability-scan
+    image: anchore/grype:latest
+    script: |
+      #!/bin/sh
+      set -e
+      echo "Running vulnerability scan on $(params.IMAGE)..."
+
+      mkdir -p $(workspaces.source.path)/vulnerability-reports
+
+      # Run vulnerability scan
+      grype $(params.IMAGE) \
+        -o json=$(workspaces.source.path)/vulnerability-reports/vulnerabilities.json \
+        -o sarif=$(workspaces.source.path)/vulnerability-reports/vulnerabilities.sarif \
+        -o table=$(workspaces.source.path)/vulnerability-reports/vulnerabilities.txt \
+        --fail-on $(params.FAIL_ON_SEVERITY)
+
+      # Generate summary report
+      CRITICAL=$(jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length' $(workspaces.source.path)/vulnerability-reports/vulnerabilities.json)
+      HIGH=$(jq '[.matches[] | select(.vulnerability.severity == "High")] | length' $(workspaces.source.path)/vulnerability-reports/vulnerabilities.json)
+      MEDIUM=$(jq '[.matches[] | select(.vulnerability.severity == "Medium")] | length' $(workspaces.source.path)/vulnerability-reports/vulnerabilities.json)
+      LOW=$(jq '[.matches[] | select(.vulnerability.severity == "Low")] | length' $(workspaces.source.path)/vulnerability-reports/vulnerabilities.json)
+
+      echo "Vulnerability Summary:" > $(workspaces.source.path)/vulnerability-reports/summary.txt
+      echo "Critical: $CRITICAL" >> $(workspaces.source.path)/vulnerability-reports/summary.txt
+      echo "High: $HIGH" >> $(workspaces.source.path)/vulnerability-reports/summary.txt
+      echo "Medium: $MEDIUM" >> $(workspaces.source.path)/vulnerability-reports/summary.txt
+      echo "Low: $LOW" >> $(workspaces.source.path)/vulnerability-reports/summary.txt
+
+      cat $(workspaces.source.path)/vulnerability-reports/summary.txt
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: istio-security-validation
+  namespace: zuul-security
+spec:
+  description: Validate Istio security configuration
+  params:
+  - name: NAMESPACE
+    type: string
+  - name: SERVICE_NAME
+    type: string
+  workspaces:
+  - name: source
+  steps:
+  - name: validate-mtls
+    image: istio/istioctl:latest
+    script: |
+      #!/bin/sh
+      set -e
+      echo "Validating mTLS configuration..."
+
+      # Check if mTLS is enforced
+      istioctl authn tls-check $(params.SERVICE_NAME).$(params.NAMESPACE).svc.cluster.local
+
+      # Validate authorization policies
+      istioctl analyze -n $(params.NAMESPACE)
+
+      # Check proxy configuration
+      POD=$(kubectl get pods -n $(params.NAMESPACE) -l app=$(params.SERVICE_NAME) -o jsonpath='{.items[0].metadata.name}')
+      istioctl proxy-config cluster $POD -n $(params.NAMESPACE)
+
+      echo "Istio security validation completed successfully"
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: security-test-suite
+  namespace: zuul-security
+spec:
+  description: Run comprehensive security tests
+  params:
+  - name: STAGING_URL
+    type: string
+  - name: TEST_SUITE
+    type: string
+    default: "security"
+  workspaces:
+  - name: source
+  steps:
+  - name: security-tests
+    image: owasp/zap2docker-weekly:latest
+    script: |
+      #!/bin/sh
+      set -e
+      echo "Running security test suite against $(params.STAGING_URL)..."
+
+      mkdir -p $(workspaces.source.path)/security-test-reports
+
+      # OWASP ZAP Security Testing
+      zap-baseline.py -t $(params.STAGING_URL) \
+        -J $(workspaces.source.path)/security-test-reports/zap-report.json \
+        -r $(workspaces.source.path)/security-test-reports/zap-report.html
+
+      # SSL/TLS Testing
+      echo "Testing SSL/TLS configuration..."
+      testssl $(params.STAGING_URL) \
+        --jsonfile $(workspaces.source.path)/security-test-reports/ssl-report.json
+
+      echo "Security testing completed"

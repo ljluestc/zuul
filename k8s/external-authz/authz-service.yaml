@@ -1,0 +1,359 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-authz-service
+  namespace: security-policies
+  labels:
+    app: external-authz
+    security.compliance.level: "critical"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: external-authz
+  template:
+    metadata:
+      labels:
+        app: external-authz
+        version: v1
+        security.scan.status: "passed"
+        security.compliance.level: "critical"
+      annotations:
+        sidecar.istio.io/inject: "true"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: external-authz-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      automountServiceAccountToken: false
+      containers:
+      - name: authz-server
+        image: your-registry.com/external-authz:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 9000
+          name: grpc
+          protocol: TCP
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+        env:
+        - name: LOG_LEVEL
+          value: "info"
+        - name: METRICS_PORT
+          value: "9090"
+        - name: GRPC_PORT
+          value: "9000"
+        - name: JWT_ISSUER
+          value: "https://accounts.yourdomain.com"
+        - name: JWT_AUDIENCE
+          value: "zuul-gateway"
+        - name: RBAC_CONFIG_PATH
+          value: "/etc/authz/rbac.yaml"
+        - name: POLICY_CONFIG_PATH
+          value: "/etc/authz/policies.yaml"
+        - name: OPA_BUNDLE_URL
+          value: "https://policy-server.yourdomain.com/bundles/authz"
+        volumeMounts:
+        - name: authz-config
+          mountPath: /etc/authz
+          readOnly: true
+        - name: tls-certs
+          mountPath: /etc/ssl/certs
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /var/cache/authz
+        livenessProbe:
+          grpc:
+            port: 9000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          grpc:
+            port: 9000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: authz-config
+        configMap:
+          name: external-authz-config
+      - name: tls-certs
+        secret:
+          secretName: authz-tls-certs
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir:
+          sizeLimit: 1Gi
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: external-authz
+              topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ext-authz
+  namespace: security-policies
+  labels:
+    app: external-authz
+spec:
+  selector:
+    app: external-authz
+  ports:
+  - name: grpc
+    port: 9000
+    targetPort: 9000
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-authz-sa
+  namespace: security-policies
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: security-policies
+  name: external-authz-role
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: external-authz-binding
+  namespace: security-policies
+subjects:
+- kind: ServiceAccount
+  name: external-authz-sa
+  namespace: security-policies
+roleRef:
+  kind: Role
+  name: external-authz-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: external-authz-config
+  namespace: security-policies
+data:
+  rbac.yaml: |
+    # Role-Based Access Control Configuration
+    roles:
+      admin:
+        permissions:
+          - resource: "*"
+            actions: ["*"]
+        conditions:
+          - source_ip_whitelist: ["10.0.0.0/8", "172.16.0.0/12"]
+          - time_of_day: "00:00-23:59"
+          - mfa_required: true
+
+      api_user:
+        permissions:
+          - resource: "api/*"
+            actions: ["GET", "POST", "PUT"]
+          - resource: "health"
+            actions: ["GET"]
+        conditions:
+          - jwt_claims:
+              scope: ["api:read", "api:write"]
+          - rate_limit: 1000/hour
+
+      readonly_user:
+        permissions:
+          - resource: "public/*"
+            actions: ["GET"]
+          - resource: "health"
+            actions: ["GET"]
+        conditions:
+          - jwt_claims:
+              scope: ["read"]
+
+      service_account:
+        permissions:
+          - resource: "internal/*"
+            actions: ["GET", "POST"]
+        conditions:
+          - source_namespace: ["zuul-security", "backend"]
+          - mtls_required: true
+          - service_mesh: "istio"
+
+    groups:
+      security_team:
+        roles: ["admin"]
+        members:
+          - "security-team@yourdomain.com"
+
+      developers:
+        roles: ["api_user"]
+        members:
+          - "dev-team@yourdomain.com"
+
+  policies.yaml: |
+    # Security Policies
+    security_policies:
+      # Default deny policy
+      default_policy: "deny"
+
+      # Time-based access control
+      time_based_access:
+        business_hours: "09:00-17:00"
+        timezone: "UTC"
+        weekend_access: false
+
+      # Geographic restrictions
+      geo_restrictions:
+        allowed_countries: ["US", "CA", "GB"]
+        blocked_countries: ["CN", "RU", "KP"]
+
+      # Rate limiting
+      rate_limiting:
+        global_limit: 10000/minute
+        per_user_limit: 100/minute
+        per_ip_limit: 1000/minute
+
+      # Threat detection
+      threat_detection:
+        sql_injection_protection: true
+        xss_protection: true
+        directory_traversal_protection: true
+        suspicious_user_agent_blocking: true
+
+      # Session management
+      session_management:
+        max_session_duration: "8h"
+        idle_timeout: "30m"
+        concurrent_sessions_limit: 3
+
+      # API security
+      api_security:
+        require_api_key: true
+        require_jwt: true
+        validate_content_type: true
+        max_request_size: "10MB"
+
+    # OPA Rego Policies
+    rego_policies:
+      admin_access: |
+        package authz.admin
+
+        default allow = false
+
+        allow {
+          input.request.http.headers.authorization
+          token := io.jwt.decode_verify(input.request.http.headers.authorization, {"secret": "your-jwt-secret"})
+          token[1].role == "admin"
+          token[1].exp > time.now_ns() / 1000000000
+          input.source.address.Address.SocketAddress.address in ["10.0.0.0/8", "172.16.0.0/12"]
+        }
+
+      api_access: |
+        package authz.api
+
+        default allow = false
+
+        allow {
+          input.request.http.method in ["GET", "POST", "PUT"]
+          startswith(input.request.http.path, "/api/")
+          token := io.jwt.decode_verify(input.request.http.headers.authorization, {"secret": "your-jwt-secret"})
+          "api:read" in token[1].scope
+          not is_rate_limited
+        }
+
+        is_rate_limited {
+          # Rate limiting logic would go here
+          false
+        }
+
+      service_mesh_access: |
+        package authz.service_mesh
+
+        default allow = false
+
+        allow {
+          input.source.certificate_fingerprint
+          input.destination.service == "zuul-gateway"
+          input.source.namespace in ["backend", "auth"]
+          input.connection.tls.enabled == true
+        }
+
+  monitoring.yaml: |
+    # Monitoring and alerting configuration
+    metrics:
+      - name: authz_requests_total
+        type: counter
+        description: "Total authorization requests"
+        labels: ["method", "path", "result"]
+
+      - name: authz_request_duration_seconds
+        type: histogram
+        description: "Authorization request duration"
+        buckets: [0.1, 0.5, 1.0, 2.5, 5.0, 10.0]
+
+      - name: authz_policy_evaluations_total
+        type: counter
+        description: "Total policy evaluations"
+        labels: ["policy", "result"]
+
+    alerts:
+      - name: HighAuthorizationFailureRate
+        condition: "rate(authz_requests_total{result='deny'}[5m]) > 0.1"
+        severity: warning
+        description: "High authorization failure rate detected"
+
+      - name: AuthorizationServiceDown
+        condition: "up{job='external-authz'} == 0"
+        severity: critical
+        description: "Authorization service is down"
+
+      - name: SlowAuthorizationRequests
+        condition: "histogram_quantile(0.95, authz_request_duration_seconds) > 1.0"
+        severity: warning
+        description: "Authorization requests are slow"

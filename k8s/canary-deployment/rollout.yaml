@@ -1,0 +1,307 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: zuul-gateway-rollout
+  namespace: zuul-security
+  labels:
+    app: zuul-gateway
+    security.scan.required: "true"
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      # Canary deployment strategy
+      steps:
+      - setWeight: 10   # Start with 10% traffic
+      - pause: {duration: 2m}
+      - setWeight: 20
+      - pause: {duration: 2m}
+      - analysis:
+          templates:
+          - templateName: security-analysis
+          - templateName: performance-analysis
+          args:
+          - name: service-name
+            value: zuul-gateway-canary
+      - pause: {duration: 5m}
+      - setWeight: 50
+      - pause: {duration: 5m}
+      - analysis:
+          templates:
+          - templateName: security-analysis
+          - templateName: performance-analysis
+          args:
+          - name: service-name
+            value: zuul-gateway-canary
+      - pause: {duration: 10m}
+      - setWeight: 100
+
+      # Canary service configuration
+      canaryService: zuul-gateway-canary
+      stableService: zuul-gateway-stable
+
+      # Traffic routing via Istio
+      trafficRouting:
+        istio:
+          virtualService:
+            name: zuul-gateway-vs
+            routes:
+            - primary
+          destinationRule:
+            name: zuul-gateway-dr
+            canarySubsetName: canary
+            stableSubsetName: stable
+
+      # Analysis and rollback configuration
+      analysis:
+        templates:
+        - templateName: security-analysis
+        - templateName: performance-analysis
+        startingStep: 2
+        args:
+        - name: service-name
+          value: zuul-gateway-canary
+
+      # Anti-affinity for security
+      antiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution: {}
+        preferredDuringSchedulingIgnoredDuringExecution:
+          weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: zuul-gateway
+            topologyKey: kubernetes.io/hostname
+
+  selector:
+    matchLabels:
+      app: zuul-gateway
+  template:
+    metadata:
+      labels:
+        app: zuul-gateway
+        version: v1
+        security.scan.status: "passed"
+        security.sbom.generated: "true"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+        sidecar.istio.io/inject: "true"
+    spec:
+      serviceAccountName: zuul-gateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      automountServiceAccountToken: false
+      containers:
+      - name: zuul-gateway
+        image: zuul-gateway:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        - containerPort: 8443
+          name: https
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+        env:
+        - name: JAVA_OPTS
+          value: "-Xmx1g -Xms512m -XX:+UseG1GC -XX:+UseContainerSupport"
+        - name: SPRING_PROFILES_ACTIVE
+          value: "production,security"
+        - name: KEYSTORE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: zuul-tls-secret
+              key: keystore-password
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: tls-certs
+          mountPath: /etc/ssl/certs
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /app/cache
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 12
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+      volumes:
+      - name: config
+        configMap:
+          name: zuul-config
+      - name: tls-certs
+        secret:
+          secretName: zuul-tls-secret
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir:
+          sizeLimit: 1Gi
+      tolerations:
+      - key: "security"
+        operator: "Equal"
+        value: "required"
+        effect: "NoSchedule"
+      nodeSelector:
+        security.k8s.io/trusted: "true"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: security-analysis
+  namespace: zuul-security
+spec:
+  args:
+  - name: service-name
+  metrics:
+  - name: security-vulnerability-scan
+    interval: 2m
+    count: 5
+    successCondition: result == "passed"
+    failureLimit: 1
+    provider:
+      job:
+        spec:
+          template:
+            spec:
+              containers:
+              - name: security-scanner
+                image: anchore/grype:latest
+                command:
+                - /bin/sh
+                - -c
+                - |
+                  # Get the current image being deployed
+                  IMAGE=$(kubectl get rollout zuul-gateway-rollout -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+                  # Run vulnerability scan
+                  grype $IMAGE -o json > /tmp/scan-results.json
+
+                  # Check for critical vulnerabilities
+                  CRITICAL_COUNT=$(jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length' /tmp/scan-results.json)
+                  HIGH_COUNT=$(jq '[.matches[] | select(.vulnerability.severity == "High")] | length' /tmp/scan-results.json)
+
+                  # Security policy: no critical, max 5 high
+                  if [ "$CRITICAL_COUNT" -gt 0 ]; then
+                    echo "failed"
+                    exit 1
+                  elif [ "$HIGH_COUNT" -gt 5 ]; then
+                    echo "failed"
+                    exit 1
+                  else
+                    echo "passed"
+                  fi
+              restartPolicy: Never
+
+  - name: runtime-security-compliance
+    interval: 30s
+    count: 10
+    successCondition: result.compliance_score >= 95
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: |
+          (
+            (zuul_security_compliance_pod_security_standards{service="{{args.service-name}}"} * 30) +
+            (zuul_security_compliance_network_policies{service="{{args.service-name}}"} * 25) +
+            (zuul_security_compliance_rbac{service="{{args.service-name}}"} * 25) +
+            (zuul_security_compliance_secrets{service="{{args.service-name}}"} * 20)
+          ) / 100
+
+  - name: mtls-certificate-validation
+    interval: 1m
+    count: 3
+    successCondition: result == 1
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: zuul_istio_mtls_enabled{service="{{args.service-name}}"}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: performance-analysis
+  namespace: zuul-security
+spec:
+  args:
+  - name: service-name
+  metrics:
+  - name: success-rate
+    interval: 30s
+    count: 5
+    successCondition: result[0] >= 0.95
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: |
+          sum(rate(http_requests_total{service="{{args.service-name}}",status!~"5.."}[2m])) /
+          sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))
+
+  - name: avg-response-time
+    interval: 30s
+    count: 5
+    successCondition: result[0] < 0.5
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{service="{{args.service-name}}"}[2m])) by (le)
+          )
+
+  - name: error-rate
+    interval: 30s
+    count: 5
+    successCondition: result[0] < 0.01
+    provider:
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: |
+          sum(rate(http_requests_total{service="{{args.service-name}}",status=~"5.."}[2m])) /
+          sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))

@@ -1,0 +1,292 @@
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: zuul-security
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: zuul-gateway-mtls
+  namespace: zuul-security
+spec:
+  selector:
+    matchLabels:
+      app: zuul-gateway
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    8080:
+      mode: STRICT
+    8443:
+      mode: STRICT
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: zuul-security
+spec:
+  {}  # Deny all by default
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: zuul-gateway-authz
+  namespace: zuul-security
+spec:
+  selector:
+    matchLabels:
+      app: zuul-gateway
+  rules:
+  # Allow health checks from system
+  - from:
+    - source:
+        principals: ["cluster.local/ns/istio-system/sa/istio-proxy"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/actuator/health/*"]
+
+  # Allow authenticated traffic from istio-gateway
+  - from:
+    - source:
+        principals: ["cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"]
+    to:
+    - operation:
+        methods: ["GET", "POST", "PUT", "DELETE", "PATCH"]
+    when:
+    - key: request.headers[authorization]
+      values: ["Bearer *"]
+
+  # Allow monitoring scraping
+  - from:
+    - source:
+        principals: ["cluster.local/ns/monitoring/sa/prometheus"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/actuator/prometheus", "/metrics"]
+
+  # Allow inter-service communication with proper JWT
+  - from:
+    - source:
+        requestPrincipals: ["https://accounts.yourdomain.com/service-account"]
+    to:
+    - operation:
+        methods: ["GET", "POST"]
+    when:
+    - key: source.labels[security-clearance]
+      values: ["high", "critical"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: zuul-gateway-jwt
+  namespace: zuul-security
+spec:
+  selector:
+    matchLabels:
+      app: zuul-gateway
+  jwtRules:
+  - issuer: "https://accounts.yourdomain.com"
+    jwksUri: "https://accounts.yourdomain.com/.well-known/jwks.json"
+    audiences:
+    - "zuul-gateway"
+    - "api.yourdomain.com"
+    forwardOriginalToken: true
+    outputPayloadToHeader: "jwt-payload"
+  - issuer: "https://oauth2.googleapis.com"
+    jwksUri: "https://www.googleapis.com/oauth2/v3/certs"
+    audiences:
+    - "your-google-client-id"
+    forwardOriginalToken: false
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: zuul-rbac-policy
+  namespace: zuul-security
+spec:
+  selector:
+    matchLabels:
+      app: zuul-gateway
+  rules:
+  # Admin access
+  - from:
+    - source:
+        requestPrincipals: ["https://accounts.yourdomain.com/*"]
+    to:
+    - operation:
+        methods: ["*"]
+        paths: ["/admin/*"]
+    when:
+    - key: request.auth.claims[role]
+      values: ["admin", "system-admin"]
+    - key: request.auth.claims[iss]
+      values: ["https://accounts.yourdomain.com"]
+
+  # API access for authenticated users
+  - from:
+    - source:
+        requestPrincipals: ["https://accounts.yourdomain.com/*"]
+    to:
+    - operation:
+        methods: ["GET", "POST", "PUT", "DELETE"]
+        paths: ["/api/*"]
+    when:
+    - key: request.auth.claims[scope]
+      values: ["api:read", "api:write"]
+
+  # Public read-only access
+  - from:
+    - source:
+        requestPrincipals: ["*"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/public/*", "/health", "/info"]
+
+  # Service-to-service communication
+  - from:
+    - source:
+        principals: ["cluster.local/ns/*/sa/service-*"]
+    to:
+    - operation:
+        methods: ["GET", "POST"]
+        paths: ["/internal/*"]
+    when:
+    - key: source.labels[security.istio.io/tlsMode]
+      values: ["istio"]
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: zuul-gateway-sidecar
+  namespace: zuul-security
+spec:
+  workloadSelector:
+    labels:
+      app: zuul-gateway
+  egress:
+  # Only allow specific outbound traffic
+  - hosts:
+    - "./zuul-backend-service.zuul-security.svc.cluster.local"
+    - "./auth-service.auth.svc.cluster.local"
+    - "istio-system/prometheus.monitoring.svc.cluster.local"
+  - port:
+      number: 443
+      protocol: HTTPS
+      name: https
+    hosts:
+    - "accounts.yourdomain.com"
+    - "api.yourdomain.com"
+    - "oauth2.googleapis.com"
+  - port:
+      number: 53
+      protocol: DNS
+      name: dns
+    hosts:
+    - "*"
+---
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: external-auth-service
+  namespace: zuul-security
+spec:
+  hosts:
+  - accounts.yourdomain.com
+  ports:
+  - number: 443
+    name: https
+    protocol: HTTPS
+  location: MESH_EXTERNAL
+  resolution: DNS
+---
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: google-oauth
+  namespace: zuul-security
+spec:
+  hosts:
+  - oauth2.googleapis.com
+  - www.googleapis.com
+  ports:
+  - number: 443
+    name: https
+    protocol: HTTPS
+  location: MESH_EXTERNAL
+  resolution: DNS
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: external-authz
+  namespace: zuul-security
+spec:
+  selector:
+    matchLabels:
+      app: zuul-gateway
+  rules:
+  - to:
+    - operation:
+        methods: ["*"]
+    when:
+    - key: source.ip
+      notValues: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    - key: request.headers[x-forwarded-for]
+      values: ["*"]
+  action: CUSTOM
+  provider:
+    name: external-authz-grpc
+---
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: zuul-security-mesh
+  namespace: istio-system
+spec:
+  values:
+    telemetry:
+      v2:
+        prometheus:
+          configOverride:
+            metric_relabeling_configs:
+            - source_labels: [__name__]
+              regex: 'istio_request_duration_milliseconds.*'
+              target_label: __tmp_istio_request_duration_milliseconds
+            - source_labels: [__tmp_istio_request_duration_milliseconds]
+              target_label: __name__
+              replacement: 'zuul_istio_request_duration_seconds'
+    pilot:
+      env:
+        EXTERNAL_ISTIOD: false
+        PILOT_ENABLE_WORKLOAD_ENTRY_AUTOREGISTRATION: true
+  meshConfig:
+    defaultConfig:
+      # Security-focused proxy configuration
+      proxyStatsMatcher:
+        inclusionRegexps:
+        - ".*circuit_breakers.*"
+        - ".*upstream_rq_retry.*"
+        - ".*upstream_rq_pending.*"
+        - ".*_cx_.*"
+      gatewayTopology:
+        numTrustedProxies: 2
+      # Enable security features
+      holdApplicationUntilProxyStarts: true
+    extensionProviders:
+    - name: external-authz-grpc
+      envoyExtAuthzGrpc:
+        service: ext-authz.security-policies.svc.cluster.local
+        port: 9000
+        timeout: 5s
+        statusOnError: 403
+        includeRequestHeadersInCheck: ["authorization", "x-user-id", "x-request-id"]
+    defaultProviders:
+      authorization: ["external-authz-grpc"]
