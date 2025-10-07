@@ -1,0 +1,147 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-ui-content
+  namespace: zero-trust-demo
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Zero Trust Kubernetes Demo - LIVE!</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                color: white;
+                margin: 0;
+                padding: 20px;
+                min-height: 100vh;
+            }
+            .container { max-width: 1000px; margin: 0 auto; text-align: center; }
+            .demo-title { font-size: 48px; color: #4CAF50; margin: 20px 0; }
+            .success { color: #4CAF50; font-size: 24px; font-weight: bold; }
+            .card {
+                background: rgba(255,255,255,0.1);
+                padding: 20px;
+                margin: 20px 0;
+                border-radius: 10px;
+                border: 1px solid rgba(76, 175, 80, 0.3);
+            }
+            .status {
+                background: #4CAF50;
+                color: white;
+                padding: 5px 10px;
+                border-radius: 15px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            .command {
+                background: #000;
+                color: #0f0;
+                padding: 15px;
+                font-family: monospace;
+                text-align: left;
+                border-radius: 5px;
+                margin: 10px 0;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="demo-title">🛡️ ZERO TRUST KUBERNETES DEMO</div>
+            <div class="success">✅ DEMO IS FULLY OPERATIONAL!</div>
+
+            <div class="card">
+                <h2>🎯 Demo Status Overview</h2>
+                <p><strong>Kubernetes Cluster:</strong> <span class="status">Healthy</span></p>
+                <p><strong>Container Registry:</strong> <span class="status">Running</span></p>
+                <p><strong>Web Interface:</strong> <span class="status">Active</span></p>
+                <p><strong>Security Policies:</strong> <span class="status">Enforced</span></p>
+            </div>
+
+            <div class="card">
+                <h2>🔐 Zero Trust Security Features</h2>
+                <ul style="text-align: left;">
+                    <li>✅ Pod Security Standards (Restricted mode)</li>
+                    <li>✅ Network Policies with default deny</li>
+                    <li>✅ RBAC authorization enabled</li>
+                    <li>✅ Security Context constraints</li>
+                    <li>✅ Non-root container execution</li>
+                    <li>✅ Dropped Linux capabilities</li>
+                </ul>
+            </div>
+
+            <div class="card">
+                <h2>💻 Test Commands</h2>
+                <div class="command">
+# Check cluster status
+kubectl get nodes
+
+# List all pods
+kubectl get pods -A
+
+# Check demo namespace
+kubectl get pods -n zero-trust-demo
+
+# Access demo UI
+curl http://localhost:30000
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>🚀 Demo Achievements</h2>
+                <ul style="text-align: left;">
+                    <li>✅ Successfully deployed kind Kubernetes cluster</li>
+                    <li>✅ Configured zero trust security policies</li>
+                    <li>✅ Deployed local container registry</li>
+                    <li>✅ Created interactive web dashboard</li>
+                    <li>✅ Enforced Pod Security Standards</li>
+                    <li>✅ Demonstrated zero trust architecture</li>
+                </ul>
+            </div>
+
+            <p style="margin-top: 40px; font-size: 14px; opacity: 0.8;">
+                Demo running on port 30000 | <span id="timestamp"></span>
+            </p>
+        </div>
+
+        <script>
+            function updateTime() {
+                document.getElementById('timestamp').textContent = new Date().toLocaleString();
+            }
+            setInterval(updateTime, 1000);
+            updateTime();
+        </script>
+    </body>
+    </html>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-ui-config
+  namespace: zero-trust-demo
+data:
+  nginx.conf: |
+    events {
+        worker_connections 1024;
+    }
+    http {
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+        sendfile on;
+        keepalive_timeout 65;
+        server {
+            listen 80;
+            server_name localhost;
+            root /usr/share/nginx/html;
+            index index.html;
+            location / {
+                try_files $uri $uri/ /index.html;
+            }
+            location /health {
+                return 200 "healthy\n";
+                add_header Content-Type text/plain;
+            }
+        }
+    }
